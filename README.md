@@ -55,7 +55,7 @@ curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
   -d "url=https://<your-domain>/webhook"
 ```
 
-## Подробный деплой на Render (пошагово)
+## Деплой на VPS (dockhost.ru) — подробная инструкция
 
 ### Шаг 1. Подготовка Telegram
 1. В BotFather создайте бота и получите `BOT_TOKEN`.
@@ -66,53 +66,146 @@ curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
    - `Edit Messages`
 4. Получите `PUBLIC_CHANNEL_ID` (например через @getidsbot или API).
 
-### Шаг 2. GitHub
-1. Создайте новый репозиторий на GitHub.
-2. Запушьте код:
-   ```bash
-   git remote add origin <URL_ВАШЕГО_REPO>
-   git push -u origin work
-   ```
+### Шаг 2. Заказ VPS на dockhost.ru
+1. Выберите минимальный тариф (достаточно для старта).
+2. Укажите ОС Ubuntu 22.04.
+3. Получите доступ по SSH (IP, логин, пароль/ключ).
 
-### Шаг 3. Создание сервисов в Render
-1. Создайте **Postgres** (Render → New → PostgreSQL).
-2. Создайте **Redis** (Render → New → Redis).
-3. Создайте **Web Service** (Docker):
-   - Repository: ваш GitHub репозиторий
-   - Runtime: Docker
-   - Start Command: `uvicorn app.main:app --host 0.0.0.0 --port 8000`
-4. Создайте **Background Worker** для Celery worker:
-   - Start Command: `celery -A app.tasks worker -l info`
-5. Создайте **Background Worker** для Celery beat:
-   - Start Command: `celery -A app.tasks beat -l info`
+### Шаг 3. Подключение к серверу и установка Docker
+Подключитесь по SSH:
 
-### Шаг 4. Переменные окружения
-В Render добавьте все переменные из `.env.example`, при этом:
-- `DATABASE_URL` берите из Render Postgres, используйте формат:
-  `postgresql+asyncpg://user:pass@host:port/dbname`
-- `REDIS_URL` берите из Render Redis.
-- `ADMIN_IDS` — список Telegram ID админов.
-- `ADMIN_BASIC_USER` / `ADMIN_BASIC_PASS` — доступ к админке.
-
-### Шаг 5. Миграции
-Один раз выполните миграции:
-1. Откройте Shell/Console в Web Service на Render.
-2. Выполните:
-   ```bash
-   alembic revision --autogenerate -m "init"
-   alembic upgrade head
-   ```
-
-### Шаг 6. Установка webhook
-Когда Web Service запущен и есть домен (например `https://rent-bot.onrender.com`):
 ```bash
-curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
-  -d "url=https://rent-bot.onrender.com/webhook"
+ssh root@<SERVER_IP>
 ```
 
-### Шаг 7. Проверка
-1. Откройте `https://<host>/health` → должно вернуть `{ "status": "ok" }`.
-2. Откройте `https://<host>/admin` и авторизуйтесь.
+Обновите систему и установите Docker + Compose:
+
+```bash
+apt update && apt upgrade -y
+apt install -y ca-certificates curl gnupg
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+  > /etc/apt/sources.list.d/docker.list
+
+apt update
+apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+Проверьте, что Docker работает:
+
+```bash
+docker --version
+docker compose version
+```
+
+### Шаг 4. Клонирование репозитория
+
+```bash
+apt install -y git
+cd /opt
+
+git clone https://github.com/iekotkg-alt/rentbot.git
+cd rentbot
+```
+
+### Шаг 5. Настройка `.env`
+
+Создайте `.env` на сервере:
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Заполните переменные:
+- `BOT_TOKEN`
+- `PUBLIC_CHANNEL_ID`
+- `ADMIN_IDS` (ID админов через запятую)
+- `ADMIN_BASIC_USER` / `ADMIN_BASIC_PASS`
+- `SENTRY_DSN` (если используете)
+
+Остальные значения можно оставить как в примере.
+
+### Шаг 6. Запуск контейнеров
+
+```bash
+docker compose up -d --build
+```
+
+Проверьте, что контейнеры запущены:
+
+```bash
+docker compose ps
+```
+
+### Шаг 7. Миграции базы данных
+
+```bash
+docker compose exec web alembic revision --autogenerate -m "init"
+docker compose exec web alembic upgrade head
+```
+
+### Шаг 8. Настройка webhook
+
+```bash
+curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
+  -d "url=https://<YOUR_DOMAIN>/webhook"
+```
+
+Если домена пока нет, можно использовать IP и поднять SSL позже.
+
+### Шаг 9. Настройка HTTPS (обязательно для webhook)
+
+Telegram требует HTTPS. Рекомендуемый вариант — Nginx + бесплатный сертификат Let’s Encrypt.
+
+1. Установите Nginx и Certbot:
+
+```bash
+apt install -y nginx certbot python3-certbot-nginx
+```
+
+2. Настройте виртуальный хост (пример `/etc/nginx/sites-available/rentbot`):
+
+```nginx
+server {
+    listen 80;
+    server_name <YOUR_DOMAIN>;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Активируйте конфиг:
+
+```bash
+ln -s /etc/nginx/sites-available/rentbot /etc/nginx/sites-enabled/
+nginx -t
+systemctl restart nginx
+```
+
+3. Получите сертификат:
+
+```bash
+certbot --nginx -d <YOUR_DOMAIN>
+```
+
+После этого ваш webhook будет работать на HTTPS.
+
+### Шаг 10. Проверка
+
+1. Откройте `https://<YOUR_DOMAIN>/health` → должно вернуть `{ "status": "ok" }`.
+2. Откройте `https://<YOUR_DOMAIN>/admin` и авторизуйтесь.
 3. Создайте объявление в боте и дождитесь публикации после модерации.
 
 ## Тестирование
